@@ -1,7 +1,9 @@
 """Utility functions for getting or creating user accounts
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
+import copy
 from typing import Any, Dict, Optional, Tuple, Union
 
 import jwt
@@ -9,6 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from dictor import dictor  # type: ignore
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.http import HttpRequest
 from django.contrib.auth.models import Group, User
 from django_saml2_auth.errors import (CANNOT_DECODE_JWT_TOKEN,
                                       CREATE_USER_ERROR, GROUP_JOIN_ERROR,
@@ -21,6 +24,8 @@ from django_saml2_auth.utils import run_hook
 from jwt.algorithms import (get_default_algorithms, has_crypto,
                             requires_cryptography)
 from jwt.exceptions import PyJWTError
+
+logger = logging.getLogger(__name__)
 
 
 def create_new_user(email: str,
@@ -57,12 +62,13 @@ def create_new_user(email: str,
         kwargs['last_name'] = last_name
 
     try:
-        user = user_model.objects.create_user(email, **kwargs)
+        user = user_model.objects.create_user_with_email_username(email, **kwargs)
         user.is_active = is_active
         user.is_staff = is_staff
         user.is_superuser = is_superuser
         user.save()
     except Exception as exc:
+        logger.exception('There was an error creating the new user.')
         raise SAMLAuthError("There was an error creating the new user.", extra={
             "exc": exc,
             "exc_type": type(exc),
@@ -76,6 +82,7 @@ def create_new_user(email: str,
         if groups:
             user.groups.set(groups)
     except Exception as exc:
+        logger.exception('There was an error joining the user to the group.')
         raise SAMLAuthError("There was an error joining the user to the group.", extra={
             "exc": exc,
             "exc_type": type(exc),
@@ -90,7 +97,7 @@ def create_new_user(email: str,
     return user
 
 
-def get_or_create_user(user: Dict[str, Any]) -> Tuple[bool, User]:
+def get_or_create_user(request: HttpRequest, user: Dict[str, Any], extra_data: Optional[Dict[str, str]]) -> Tuple[bool, User]:
     """Get or create a new user and optionally add it to one or more group(s)
 
     Args:
@@ -123,7 +130,7 @@ def get_or_create_user(user: Dict[str, Any]) -> Tuple[bool, User]:
 
             create_user_trigger = dictor(saml2_auth_settings, "TRIGGER.CREATE_USER")
             if create_user_trigger:
-                run_hook(create_user_trigger, user)  # type: ignore
+                run_hook(create_user_trigger, request, user, target_user, extra_data)
 
             target_user.refresh_from_db()
             created = True
@@ -204,6 +211,14 @@ def get_user(user: Union[str, Dict[str, str]]) -> User:
             return found_user
 
     user_id = get_user_id(user)
+
+    get_user_trigger = dictor(settings.SAML2_AUTH, "TRIGGER.GET_USER")
+    if get_user_trigger:
+        logger.debug('Calling get_user trigger %s', user_id)
+        user = run_hook(get_user_trigger, user_id)
+        if user is None:
+            raise user_model.DoesNotExist
+        return user
 
     # Should email be case-sensitive or not. Default is False (case-insensitive).
     login_case_sensitive = dictor(saml2_auth_settings, "LOGIN_CASE_SENSITIVE", False)
@@ -298,7 +313,7 @@ def validate_public_key(jwt_algorithm: str, jwt_public_key: str) -> None:
         })
 
 
-def create_jwt_token(user_id: str) -> Optional[str]:
+def create_jwt_token(user_id: str, **extra_data) -> Optional[str]:
     """Create a new JWT token
 
     Args:
@@ -327,6 +342,7 @@ def create_jwt_token(user_id: str) -> Optional[str]:
         "exp": (datetime.now(tz=timezone.utc) +
                 timedelta(seconds=jwt_expiration)).timestamp()
     }
+    payload.update(extra_data)
 
     # If a passphrase is specified, we need to use a PEM-encoded private key
     # to decrypt the private key in order to encode the JWT token.
@@ -400,7 +416,7 @@ def create_custom_or_default_jwt(user: Union[str, User]):
     return jwt_token
 
 
-def decode_jwt_token(jwt_token: str) -> Optional[str]:
+def decode_jwt_token(jwt_token: str) -> Tuple[Optional[str], Dict[str, str]]:
     """Decode a JWT token
 
     Args:
@@ -410,7 +426,7 @@ def decode_jwt_token(jwt_token: str) -> Optional[str]:
         SAMLAuthError: Cannot decode JWT token.
 
     Returns:
-        Optional[str]: A user_id as str or None.
+        Tuple[Optional[str], Dict[str, str]]: A user_id as str or None, and dictionary wih extra data.
     """
     saml2_auth_settings = settings.SAML2_AUTH
 
@@ -430,7 +446,9 @@ def decode_jwt_token(jwt_token: str) -> Optional[str]:
     try:
         data = jwt.decode(jwt_token, secret, algorithms=jwt_algorithm)
         user_model = get_user_model()
-        return data[user_model.USERNAME_FIELD]
+        extra_data = copy.copy(data)
+        extra_data.pop('exp')
+        return data[user_model.USERNAME_FIELD], extra_data
     except PyJWTError as exc:
         raise SAMLAuthError("Cannot decode JWT token.", extra={
             "exc": exc,

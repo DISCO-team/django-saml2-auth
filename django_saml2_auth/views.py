@@ -4,6 +4,7 @@
 """Endpoints for SAML SSO login"""
 
 import urllib.parse as urlparse
+import logging
 from typing import Optional, Union
 from urllib.parse import unquote
 
@@ -24,7 +25,7 @@ except ImportError:
 from django.views.decorators.csrf import csrf_exempt
 from django_saml2_auth.errors import (INACTIVE_USER, INVALID_NEXT_URL,
                                       INVALID_REQUEST_METHOD, INVALID_TOKEN,
-                                      USER_MISMATCH)
+                                      USER_MISMATCH, BEFORE_LOGIN_TRIGGER_FAILURE)
 from django_saml2_auth.exceptions import SAMLAuthError
 from django_saml2_auth.saml import (decode_saml_response,
                                     extract_user_identity, get_assertion_url,
@@ -34,6 +35,9 @@ from django_saml2_auth.user import (create_custom_or_default_jwt,
                                     get_or_create_user, get_user_id)
 from django_saml2_auth.utils import (exception_handler, get_reverse,
                                      is_jwt_well_formed, run_hook)
+
+
+logger = logging.getLogger(__name__)
 
 
 @login_required
@@ -96,6 +100,7 @@ def acs(request: HttpRequest):
     user = extract_user_identity(authn_response.get_identity())  # type: ignore
 
     next_url = request.session.get("login_next_url")
+    extra_data = None
 
     # A RelayState is an HTTP parameter that can be included as part of the SAML request
     # and SAML response; usually is meant to be an opaque identifier that is passed back
@@ -111,10 +116,13 @@ def acs(request: HttpRequest):
         next_url = get_default_next_url()
 
     if relay_state and relay_state_is_token:
-        redirected_user_id = decode_custom_or_default_jwt(relay_state)
+        redirected_user_id, extra_data = decode_custom_or_default_jwt(relay_state)
 
         # This prevents users from entering an email on the SP, but use a different email on IdP
-        if get_user_id(user) != redirected_user_id:
+        logger.debug('get_user_id vs redirected_user_id: %s %s', get_user_id(user), redirected_user_id)
+
+        check_user_id = dictor(settings.SAML2_AUTH, "ASSERT_SP_VERSUS_IDP_USER_ID", default=True)
+        if check_user_id and get_user_id(user) != redirected_user_id:
             raise SAMLAuthError("The user identifier doesn't match.", extra={
                 "exc_type": ValueError,
                 "error_code": USER_MISMATCH,
@@ -122,11 +130,31 @@ def acs(request: HttpRequest):
                 "status_code": 403
             })
 
-    is_new_user, target_user = get_or_create_user(user)
+    logger.debug('trying to get or create user')
+    is_new_user, target_user = get_or_create_user(request, user, extra_data)
+
+    logger.debug('get_or_create_user %s %s', is_new_user, target_user)
+
+    get_next_url_trigger = dictor(settings.SAML2_AUTH, "TRIGGER.GET_NEXT_URL")
+    if get_next_url_trigger:
+        logger.debug('running next url trigger')
+        next_url = run_hook(get_next_url_trigger, target_user, extra_data)
+
+    logger.debug('next url %s', next_url)
 
     before_login_trigger = dictor(saml2_auth_settings, "TRIGGER.BEFORE_LOGIN")
     if before_login_trigger:
-        run_hook(before_login_trigger, user)  # type: ignore
+        hook_value = run_hook(before_login_trigger, request, user, target_user, is_new_user, extra_data)
+        if hook_value is False:
+            raise SAMLAuthError("The before login trigger returned False.", extra={
+                "exc_type": ValueError,
+                "error_code": BEFORE_LOGIN_TRIGGER_FAILURE,
+                "reason": "Before login trigger returned False.",
+                "status_code": 403
+            })
+        elif isinstance(hook_value, HttpResponseRedirect):
+            # allow to redirect to some informative page
+            return hook_value
 
     request.session.flush()
 
@@ -156,7 +184,8 @@ def acs(request: HttpRequest):
 
         after_login_trigger = dictor(saml2_auth_settings, "TRIGGER.AFTER_LOGIN")
         if after_login_trigger:
-            run_hook(after_login_trigger, request.session, user)  # type: ignore
+            run_hook(after_login_trigger, request, user, target_user, extra_data)
+            logger.warning('request session %s', dict(request.session))
     else:
         raise SAMLAuthError("The target user is inactive.", extra={
             "exc_type": Exception,
@@ -202,7 +231,7 @@ def sp_initiated_login(request: HttpRequest) -> HttpResponseRedirect:
     if request.method == "GET":
         token = request.GET.get("token")
         if token:
-            user_id = decode_custom_or_default_jwt(token)
+            user_id, extra_data = decode_custom_or_default_jwt(token)
             if not user_id:
                 raise SAMLAuthError("The token is invalid.", extra={
                     "exc_type": ValueError,
@@ -210,8 +239,9 @@ def sp_initiated_login(request: HttpRequest) -> HttpResponseRedirect:
                     "reason": "The token is invalid.",
                     "status_code": 403
                 })
-            saml_client = get_saml_client(get_assertion_url(request), acs, user_id)
-            jwt_token = create_custom_or_default_jwt(user_id)
+            saml_client = get_saml_client(get_assertion_url(request), acs, request, user_id, **extra_data)
+            jwt_token = create_custom_or_default_jwt(user_id, **extra_data)
+            logger.debug('Created JWT token with extra data %s for user_id %s', extra_data, user_id)
             _, info = saml_client.prepare_for_authenticate(  # type: ignore
                 sign=False, relay_state=jwt_token)
             redirect_url = dict(info["headers"]).get("Location", "")
@@ -272,7 +302,7 @@ def signin(request: HttpRequest) -> HttpResponseRedirect:
 
     request.session["login_next_url"] = next_url
 
-    saml_client = get_saml_client(get_assertion_url(request), acs)
+    saml_client = get_saml_client(get_assertion_url(request), acs, request)
     _, info = saml_client.prepare_for_authenticate(relay_state=next_url)  # type: ignore
 
     redirect_url = dict(info["headers"]).get("Location", "")

@@ -4,9 +4,11 @@ Tests for user.py
 
 from typing import Any, Dict, Union
 
+import mock
 import pytest
+from django.contrib.auth.hashers import is_password_usable
+from django.contrib.auth.models import Group, UserManager
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group, User
 from django_saml2_auth.exceptions import SAMLAuthError
 from django_saml2_auth.user import (create_custom_or_default_jwt, create_new_user,
                                     decode_custom_or_default_jwt, get_or_create_user,
@@ -14,6 +16,29 @@ from django_saml2_auth.user import (create_custom_or_default_jwt, create_new_use
 from jwt.exceptions import PyJWTError
 from pytest_django.fixtures import SettingsWrapper
 
+
+User = get_user_model()
+
+
+class MyUserManager(UserManager):
+    def create_user_with_email_username(self, email, password=None, **extra_fields):
+        """
+        Required for django-saml2-auth integration.
+        """
+        if email == '':
+            raise ValueError('invalid email')
+        password = password or ''
+        return super().create(username=email, email=email, password=password, **extra_fields)
+
+
+def has_usable_password(self):
+    if not self.password:
+        return False
+    return is_password_usable(self.password)
+
+
+User.add_to_class('objects', MyUserManager())
+User.add_to_class('has_usable_password', has_usable_password)
 
 private_key = """-----BEGIN RSA PRIVATE KEY-----
 Proc-Type: 4,ENCRYPTED
@@ -87,7 +112,7 @@ GwIDAQAB
 -----END PUBLIC KEY-----"""
 
 
-def trigger_change_first_name(user: Union[str, Dict[str, str]]) -> None:
+def trigger_change_first_name(request, user: Union[str, Dict[str, str]], target_user, extra_fields) -> None:
     """Trigger function to change user's first name.
 
     Args:
@@ -235,7 +260,8 @@ def test_get_or_create_user_success(settings: SettingsWrapper):
     }
 
     Group.objects.create(name="users")
-    created, user = get_or_create_user({
+    request = mock.Mock()
+    created, user = get_or_create_user(request, {
         "username": "test@example.com",
         "first_name": "John",
         "last_name": "Doe",
@@ -245,7 +271,7 @@ def test_get_or_create_user_success(settings: SettingsWrapper):
             "user.last_name": "Doe",
             "groups": ["consumers"]
         }
-    })
+    }, None)
     assert created
     assert user.username == "test@example.com"
     assert user.is_active is True
@@ -267,12 +293,13 @@ def test_get_or_create_user_trigger_error(settings: SettingsWrapper):
         }
     }
 
+    request = mock.Mock()
     with pytest.raises(SAMLAuthError) as exc_info:
-        get_or_create_user({
+        get_or_create_user(request, {
             "username": "test@example.com",
             "first_name": "John",
             "last_name": "Doe"
-        })
+        }, None)
 
     assert str(exc_info.value) == (
         "module 'django_saml2_auth.tests.test_user' has no attribute 'nonexistent_trigger'")
@@ -340,11 +367,12 @@ def test_get_or_create_user_trigger_change_first_name(settings: SettingsWrapper)
         }
     }
 
-    created, user = get_or_create_user({
+    request = mock.Mock()
+    created, user = get_or_create_user(request, {
         "username": "test@example.com",
         "first_name": "John",
         "last_name": "Doe"
-    })
+    }, None)
 
     assert created
     assert user.username == "test@example.com"
@@ -365,12 +393,13 @@ def test_get_or_create_user_should_not_create_user(settings: SettingsWrapper):
         "CREATE_USER": False,
     }
 
+    request = mock.Mock()
     with pytest.raises(SAMLAuthError) as exc_info:
-        get_or_create_user({
+        get_or_create_user(request, {
             "username": "test@example.com",
             "first_name": "John",
             "last_name": "Doe"
-        })
+        }, None)
 
     assert str(exc_info.value) == "Cannot create user."
     assert exc_info.value.extra is not None
@@ -535,7 +564,7 @@ def test_create_and_decode_jwt_token_success(
     settings.SAML2_AUTH = saml2_settings
 
     jwt_token = create_custom_or_default_jwt("test@example.com")
-    user_id = decode_custom_or_default_jwt(jwt_token)
+    user_id, _ = decode_custom_or_default_jwt(jwt_token)
     assert user_id == "test@example.com"
 
 
@@ -624,6 +653,25 @@ def test_decode_jwt_token_with_incorrect_jwt_settings(
         decode_custom_or_default_jwt("WHATEVER")
 
     assert str(exc_info.value) == error_msg
+
+
+def test_decode_jwt_token_success():
+    """Test decode_jwt_token function by verifying if the newly created JWT token using
+    create_jwt_token function is valid."""
+    jwt_token = create_custom_or_default_jwt("test@example.com")
+    user_id, _ = decode_custom_or_default_jwt(jwt_token)
+
+    assert user_id == "test@example.com"
+
+
+def test_decode_jwt_token_success_extra_data():
+    """Test decode_jwt_token function by verifying if the newly created JWT token using
+    create_jwt_token function is valid."""
+    jwt_token = create_custom_or_default_jwt("test@example.com", foo='bar', baz='bam')
+    user_id, extra_data = decode_custom_or_default_jwt(jwt_token)
+
+    assert user_id == "test@example.com"
+    assert extra_data == {"foo": "bar", "baz": "bam", "username": "test@example.com"}
 
 
 def test_decode_jwt_token_failure():

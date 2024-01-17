@@ -184,6 +184,8 @@ def exception_handler(
         try:
             result = function(request)
         except (SAMLAuthError, Exception) as exc:
+            if getattr(settings, 'DEBUG', False):
+                raise
             result = handle_exception(exc, request)
         return result
     return wrapper

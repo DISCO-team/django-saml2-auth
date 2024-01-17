@@ -84,7 +84,7 @@ def validate_metadata_url(url: str) -> bool:
     return True
 
 
-def get_metadata(user_id: Optional[str] = None) -> Mapping[str, Any]:
+def get_metadata(request: HttpRequest, user_id: Optional[str] = None, **extra_data) -> Mapping[str, Any]:
     """Returns metadata information, either by running the GET_METADATA_AUTO_CONF_URLS hook function
     if available, or by checking and returning a local file path or the METADATA_AUTO_CONF_URL. URLs
     are always validated and invalid URLs will be either filtered or raise a SAMLAuthError
@@ -105,12 +105,18 @@ def get_metadata(user_id: Optional[str] = None) -> Mapping[str, Any]:
     saml2_auth_settings = settings.SAML2_AUTH
     get_metadata_trigger = dictor(saml2_auth_settings, "TRIGGER.GET_METADATA_AUTO_CONF_URLS")
     if get_metadata_trigger:
-        metadata_urls = run_hook(get_metadata_trigger, user_id)  # type: ignore
+        metadata_urls = run_hook(get_metadata_trigger, request, user_id, **extra_data)
         if metadata_urls:
             # Filter invalid metadata URLs
             filtered_metadata_urls = list(
-                filter(lambda md: validate_metadata_url(md["url"]), metadata_urls))
-            return {"remote": filtered_metadata_urls}
+                filter(lambda md: 'url' in md.keys() and validate_metadata_url(md["url"]), metadata_urls))
+            inline_file_contents = [x['inline'] for x in list(filter(lambda md: "inline" in md.keys(), metadata_urls))]
+            ret = {}
+            if filtered_metadata_urls:
+                ret["remote"] = filtered_metadata_urls
+            if inline_file_contents:
+                ret["inline"] = inline_file_contents
+            return ret
         else:
             raise SAMLAuthError("No metadata URL associated with the given user identifier.",
                                 extra={
@@ -138,8 +144,10 @@ def get_metadata(user_id: Optional[str] = None) -> Mapping[str, Any]:
 
 def get_saml_client(domain: str,
                     acs: Callable[..., HttpResponse],
-                    user_id: Optional[str] = None,
-                    saml_response: Optional[str] = None) -> Optional[Saml2Client]:
+                    request: HttpRequest,
+                    user_id: str = None,
+                    saml_response: Optional[str] = None,
+                    **extra_data) -> Optional[Saml2Client]:
     """Create a new Saml2Config object with the given config and return an initialized Saml2Client
     using the config object. The settings are read from django settings key: SAML2_AUTH.
 
@@ -166,11 +174,11 @@ def get_saml_client(domain: str,
     if get_user_id_from_saml_response and saml_response:
         user_id = run_hook(get_user_id_from_saml_response, saml_response, user_id)  # type: ignore
 
-    metadata = get_metadata(user_id)
-    if (metadata and (
+    metadata = get_metadata(request, user_id, **extra_data)
+    if (metadata == {} or (metadata and (
             ("local" in metadata and not metadata["local"]) or
             ("remote" in metadata and not metadata["remote"])
-    )):
+    ))):
         raise SAMLAuthError("Metadata URL/file is missing.", extra={
             "exc_type": NoReverseMatch,
             "error_code": NO_METADATA_URL_OR_FILE,
@@ -205,8 +213,14 @@ def get_saml_client(domain: str,
         },
     }
 
+    get_entity_id_trigger = dictor(saml2_auth_settings, "TRIGGER.GET_ENTITY_ID_URL")
+    if get_entity_id_trigger:
+        entity_id = run_hook(get_entity_id_trigger, request, user_id)
+        if entity_id:
+            saml_settings["entityid"] = entity_id
+
     entity_id = saml2_auth_settings.get("ENTITY_ID")
-    if entity_id:
+    if "entityid" not in saml_settings and entity_id:
         saml_settings["entityid"] = entity_id
 
     name_id_format = saml2_auth_settings.get("NAME_ID_FORMAT")
@@ -293,7 +307,7 @@ def decode_saml_response(
         saml_response = base64.b64decode(response).decode('UTF-8')
     except Exception:
         saml_response = None
-    saml_client = get_saml_client(get_assertion_url(request), acs, saml_response=saml_response)
+    saml_client = get_saml_client(get_assertion_url(request), acs, request, saml_response=saml_response)
     if not saml_client:
         raise SAMLAuthError("There was an error creating the SAML client.", extra={
             "exc_type": ValueError,
@@ -378,6 +392,9 @@ def extract_user_identity(user_identity: Dict[str, Any]) -> Dict[str, Optional[A
         user["email"] = user["email"].lower()
     if user["username"]:
         user["username"] = user["username"].lower()
+    else:
+        # in case UserName is not present, fallback to Email
+        user["username"] = user["email"]
 
     # For backwards compatibility
     user["user_identity"] = user_identity
