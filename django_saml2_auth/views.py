@@ -231,8 +231,10 @@ def sp_initiated_login(request: HttpRequest) -> HttpResponseRedirect:
     if request.method == "GET":
         token = request.GET.get("token")
         if token:
+            saml2_auth_settings = settings.SAML2_AUTH
             user_id, extra_data = decode_custom_or_default_jwt(token)
-            if not user_id:
+            enforce_validation = dictor(saml2_auth_settings, "ENFORCE_SP_TOKEN_VALIDATION", False)
+            if enforce_validation and not user_id:
                 raise SAMLAuthError("The token is invalid.", extra={
                     "exc_type": ValueError,
                     "error_code": INVALID_TOKEN,

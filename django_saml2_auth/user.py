@@ -365,7 +365,7 @@ def create_jwt_token(user_id: str, **extra_data) -> Optional[str]:
     return jwt.encode(payload, secret, algorithm=jwt_algorithm)
 
 
-def create_custom_or_default_jwt(user: Union[str, User]):
+def create_custom_or_default_jwt(user: Union[str, User], **extra_data):
     """Create a new JWT token, eventually using custom trigger
 
     Args:
@@ -379,6 +379,7 @@ def create_custom_or_default_jwt(user: Union[str, User]):
         Optional[str]: JWT token
     """
     saml2_auth_settings = settings.SAML2_AUTH
+    enforce_validation = dictor(saml2_auth_settings, "ENFORCE_SP_TOKEN_VALIDATION", False)
     user_model = get_user_model()
 
     custom_create_jwt_trigger = dictor(saml2_auth_settings, "TRIGGER.CUSTOM_CREATE_JWT")
@@ -398,20 +399,20 @@ def create_custom_or_default_jwt(user: Union[str, User]):
                 user_model.USERNAME_FIELD: user_id
             }
             target_user = get_user(_user)
-        jwt_token = run_hook(custom_create_jwt_trigger, target_user)  # type: ignore
+        jwt_token = run_hook(custom_create_jwt_trigger, target_user, **extra_data)  # type: ignore
     else:
         # If user_id is not set, retrieve it from user instance
-        if not user_id:
+        if enforce_validation and not user_id:
             user_id = getattr(user, user_model.USERNAME_FIELD)
         # Create a new JWT token with PyJWT
-        if not user_id:
+        if enforce_validation and not user_id:
             raise SAMLAuthError("Cannot create JWT token. Specify a user.", extra={
                 "exc_type": Exception,
                 "error_code": NO_USER_ID,
                 "reason": "Cannot create JWT token for login.",
                 "status_code": 500
             })
-        jwt_token = create_jwt_token(user_id)
+        jwt_token = create_jwt_token(user_id, **extra_data)
 
     return jwt_token
 
