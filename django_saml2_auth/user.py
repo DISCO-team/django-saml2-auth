@@ -200,16 +200,7 @@ def get_user(user: Union[str, Dict[str, str]]) -> User:
         User: An instance of the User model
     """
     saml2_auth_settings = settings.SAML2_AUTH
-    get_user_custom_method = dictor(saml2_auth_settings, "TRIGGER.GET_USER")
-
     user_model = get_user_model()
-    if get_user_custom_method:
-        found_user = run_hook(get_user_custom_method, user)  # type: ignore
-        if not found_user:
-            raise user_model.DoesNotExist
-        else:
-            return found_user
-
     user_id = get_user_id(user)
 
     get_user_trigger = dictor(settings.SAML2_AUTH, "TRIGGER.GET_USER")
