@@ -2,6 +2,7 @@
 """
 import base64
 from typing import Any, Callable, Dict, Mapping, Optional, Union
+import logging
 
 from dictor import dictor  # type: ignore
 from django.conf import settings
@@ -28,6 +29,7 @@ from saml2.httpbase import HTTPBase
 from saml2.mdstore import MetaDataExtern
 from saml2.response import AuthnResponse
 
+logger = logging.getLogger(__name__)
 
 def get_assertion_url(request: HttpRequest) -> str:
     """Extract protocol and domain name from request, if ASSERTION_URL is not specified in settings,
@@ -315,6 +317,9 @@ def decode_saml_response(
             "reason": "There was an error processing your request.",
             "status_code": 500
         })
+
+    logger.debug("SAML Response: %s", response)
+    logger.debug("SAML Response type: %s", type(response))
 
     authn_response = saml_client.parse_authn_request_response(response, entity.BINDING_HTTP_POST)
     if not authn_response:
