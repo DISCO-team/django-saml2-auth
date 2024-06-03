@@ -215,7 +215,7 @@ def get_saml_client(domain: str,
 
     get_entity_id_trigger = dictor(saml2_auth_settings, "TRIGGER.GET_ENTITY_ID_URL")
     if get_entity_id_trigger:
-        entity_id = run_hook(get_entity_id_trigger, request, user_id)
+        entity_id = run_hook(get_entity_id_trigger, request, user_id, **extra_data)
         if entity_id:
             saml_settings["entityid"] = entity_id
 
